@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+AGENTS.md
+graphify-out/
+.graphifyignore
+.codex
+.claude

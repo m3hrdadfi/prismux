@@ -1,0 +1,274 @@
+services:
+  supabase-db:
+    image: postgres:17.6-alpine
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-replace-this-postgres-password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/001-auth.sql:/docker-entrypoint-initdb.d/001-auth.sql:ro
+    networks:
+      - app_internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  supabase-auth:
+    image: supabase/gotrue:v2.186.0
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+    environment:
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: 9999
+      API_EXTERNAL_URL: ${SUPABASE_PUBLIC_URL:-http://localhost:8100}
+      GOTRUE_SITE_URL: ${SUPABASE_PUBLIC_URL:-http://localhost:8100}
+      GOTRUE_URI_ALLOW_LIST: ${SUPABASE_PUBLIC_URL:-http://localhost:8100}
+      GOTRUE_DISABLE_SIGNUP: "true"
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-replace-this-postgres-password}@supabase-db:5432/postgres?search_path=auth
+      GOTRUE_DB_DB_NAMESPACE: auth
+      DB_NAMESPACE: auth
+      GOTRUE_JWT_SECRET: ${SUPABASE_JWT_SECRET:-replace-this-jwt-secret-with-at-least-32-characters}
+      GOTRUE_JWT_ISSUER: ${SUPABASE_JWT_ISSUER:-prismux}
+      GOTRUE_JWT_AUD: authenticated
+      GOTRUE_JWT_EXP: 3600
+      GOTRUE_JWT_ADMIN_ROLES: service_role
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
+      GOTRUE_MAILER_AUTOCONFIRM: "false"
+    networks:
+      - app_internal
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9999/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  supabase-rest:
+    image: postgrest/postgrest:v14.12
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      PGRST_DB_URI: postgresql://authenticator:${POSTGRES_PASSWORD:-replace-this-postgres-password}@supabase-db:5432/postgres
+      PGRST_DB_SCHEMAS: public,storage
+      PGRST_DB_EXTRA_SEARCH_PATH: public
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_DB_MAX_ROWS: 1000
+      PGRST_JWT_SECRET: ${SUPABASE_JWT_SECRET:-replace-this-jwt-secret-with-at-least-32-characters}
+      PGRST_DB_USE_LEGACY_GUCS: "false"
+      PGRST_APP_SETTINGS_JWT_SECRET: ${SUPABASE_JWT_SECRET:-replace-this-jwt-secret-with-at-least-32-characters}
+      PGRST_APP_SETTINGS_JWT_EXP: 3600
+      PGRST_ADMIN_SERVER_PORT: 3001
+      PGRST_ADMIN_SERVER_HOST: localhost
+    networks:
+      - app_internal
+    healthcheck:
+      test: ["CMD", "postgrest", "--ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+
+  supabase-storage:
+    image: supabase/storage-api:v1.60.4
+    entrypoint: ["/bin/sh", "/opt/prismux/storage-entrypoint.sh"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      supabase-rest:
+        condition: service_started
+      supabase-studio-keys:
+        condition: service_completed_successfully
+    environment:
+      ANON_KEY_FILE: /run/supabase-studio-keys/anon-key
+      SERVICE_KEY_FILE: /run/supabase-studio-keys/service-role-key
+      POSTGREST_URL: http://supabase-rest:3000
+      AUTH_JWT_SECRET: ${SUPABASE_JWT_SECRET:-replace-this-jwt-secret-with-at-least-32-characters}
+      DATABASE_URL: postgresql://supabase_storage_admin:${POSTGRES_PASSWORD:-replace-this-postgres-password}@supabase-db:5432/postgres
+      STORAGE_PUBLIC_URL: ${SUPABASE_STUDIO_PUBLIC_URL:-http://localhost:8083}/storage/v1
+      REQUEST_ALLOW_X_FORWARDED_PATH: "true"
+      FILE_SIZE_LIMIT: ${STORAGE_FILE_SIZE_LIMIT:-52428800}
+      STORAGE_BACKEND: file
+      FILE_STORAGE_BACKEND_PATH: /var/lib/storage
+      GLOBAL_S3_BUCKET: ${STORAGE_BUCKET_DIRECTORY:-stub}
+      TENANT_ID: ${STORAGE_TENANT_ID:-stub}
+      REGION: ${STORAGE_REGION:-local}
+      ENABLE_IMAGE_TRANSFORMATION: "false"
+    volumes:
+      - ./infra/supabase/storage-entrypoint.sh:/opt/prismux/storage-entrypoint.sh:ro
+      - supabase_studio_keys:/run/supabase-studio-keys:ro
+      - supabase_storage_data:/var/lib/storage
+    networks:
+      - app_internal
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:5000/status"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    restart: unless-stopped
+
+  supabase-studio-keys:
+    image: python:3.12-alpine
+    command: ["python", "/opt/prismux/generate_supabase_studio_keys.py", "/run/supabase-studio-keys"]
+    environment:
+      SUPABASE_JWT_SECRET: ${SUPABASE_JWT_SECRET:-replace-this-jwt-secret-with-at-least-32-characters}
+      SUPABASE_JWT_ISSUER: ${SUPABASE_JWT_ISSUER:-prismux}
+    volumes:
+      - ./scripts/generate_supabase_studio_keys.py:/opt/prismux/generate_supabase_studio_keys.py:ro
+      - supabase_studio_keys:/run/supabase-studio-keys
+    networks:
+      - app_internal
+    restart: "no"
+
+  supabase-meta:
+    image: supabase/postgres-meta:v0.96.6
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+    environment:
+      PG_META_PORT: 8080
+      PG_META_DB_HOST: supabase-db
+      PG_META_DB_PORT: 5432
+      PG_META_DB_NAME: postgres
+      PG_META_DB_USER: postgres
+      PG_META_DB_PASSWORD: ${POSTGRES_PASSWORD:-replace-this-postgres-password}
+      CRYPTO_KEY: ${SUPABASE_JWT_SECRET:-replace-this-jwt-secret-with-at-least-32-characters}
+    networks:
+      - app_internal
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:8080/health').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+
+  supabase-studio:
+    image: supabase/studio:2026.08.03-sha-022b374
+    entrypoint: ["/bin/sh", "/opt/prismux/studio-entrypoint.sh"]
+    depends_on:
+      supabase-meta:
+        condition: service_healthy
+      supabase-studio-keys:
+        condition: service_completed_successfully
+      supabase-auth:
+        condition: service_healthy
+    environment:
+      HOSTNAME: "0.0.0.0"
+      STUDIO_PG_META_URL: http://supabase-meta:8080
+      POSTGRES_HOST: supabase-db
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-replace-this-postgres-password}
+      POSTGRES_USER_READ_WRITE: postgres
+      PG_META_CRYPTO_KEY: ${SUPABASE_JWT_SECRET:-replace-this-jwt-secret-with-at-least-32-characters}
+      PGRST_DB_SCHEMAS: public,storage
+      PGRST_DB_MAX_ROWS: 1000
+      PGRST_DB_EXTRA_SEARCH_PATH: public
+      DEFAULT_ORGANIZATION_NAME: ${SUPABASE_STUDIO_ORGANIZATION:-PRISMUX}
+      DEFAULT_PROJECT_NAME: ${SUPABASE_STUDIO_PROJECT:-PRISMUX}
+      SUPABASE_URL: http://supabase-studio-gateway:8080
+      SUPABASE_PUBLIC_URL: ${SUPABASE_STUDIO_PUBLIC_URL:-http://localhost:8083}
+      SUPABASE_ANON_KEY_FILE: /run/supabase-studio-keys/anon-key
+      SUPABASE_SERVICE_KEY_FILE: /run/supabase-studio-keys/service-role-key
+      AUTH_JWT_SECRET: ${SUPABASE_JWT_SECRET:-replace-this-jwt-secret-with-at-least-32-characters}
+      ENABLED_FEATURES_LOGS_ALL: "false"
+    volumes:
+      - supabase_studio_keys:/run/supabase-studio-keys:ro
+      - ./infra/supabase/studio-entrypoint.sh:/opt/prismux/studio-entrypoint.sh:ro
+    networks:
+      - app_internal
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://localhost:3000/api/platform/profile').then(r => { if (r.status !== 200) process.exit(1) }).catch(() => process.exit(1))\""]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
+    restart: unless-stopped
+
+  supabase-studio-gateway:
+    build:
+      context: .
+      dockerfile: infra/supabase/studio-gateway.Dockerfile
+    depends_on:
+      supabase-studio:
+        condition: service_healthy
+      supabase-storage:
+        condition: service_healthy
+      supabase-rest:
+        condition: service_healthy
+    environment:
+      DASHBOARD_USERNAME: ${DASHBOARD_USERNAME:-prismux-admin}
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:-change-this-studio-password}
+    ports:
+      - "127.0.0.1:${SUPABASE_STUDIO_PORT:-8083}:8080"
+    volumes:
+      - ./infra/supabase/studio-nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - app_internal
+      - studio_access
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  migrate:
+    build: .
+    command: ["sh", "/app/scripts/migrate.sh"]
+    env_file:
+      - .env
+    environment:
+      DATABASE_MIGRATION_URL: postgresql+asyncpg://postgres:${POSTGRES_PASSWORD:-replace-this-postgres-password}@supabase-db:5432/postgres
+      PROXY_DATABASE_PASSWORD: ${PROXY_DATABASE_PASSWORD:-replace-this-proxy-password}
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+    networks:
+      - app_internal
+    restart: "no"
+
+  proxy:
+    build: .
+    ports:
+      - "${PROXY_PORT:-8100}:8100"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://prismux_app:${PROXY_DATABASE_PASSWORD:-replace-this-proxy-password}@supabase-db:5432/postgres
+      SUPABASE_AUTH_URL: http://supabase-auth:9999
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      supabase-auth:
+        condition: service_healthy
+    networks:
+      - app_internal
+      - provider_egress
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8100/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+networks:
+  app_internal:
+    internal: true
+  studio_access:
+  provider_egress:
+
+volumes:
+  postgres_data:
+  supabase_studio_keys:
+  supabase_storage_data:

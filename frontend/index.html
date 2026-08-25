@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#f7f7f8" />
+    <meta name="description" content="PRISMUX — self-hosted AI provider gateway and control plane" />
+    <link rel="icon" type="image/png" href="/brand/prismux-light.png" />
+    <title>PRISMUX</title>
+    <script>
+      (() => {
+        const saved = localStorage.getItem("prismux-theme") ?? localStorage.getItem("rate-limit-proxy-theme");
+        const resolved = saved === "dark" || saved === "light"
+          ? saved
+          : matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        localStorage.setItem("prismux-theme", resolved);
+        const dark = resolved === "dark";
+        document.documentElement.classList.toggle("dark", dark);
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
