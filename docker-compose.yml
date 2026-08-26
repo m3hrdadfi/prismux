@@ -223,7 +223,9 @@ services:
     restart: unless-stopped
 
   migrate:
-    build: .
+    build:
+      context: .
+      target: app-runtime
     command: ["sh", "/app/scripts/migrate.sh"]
     env_file:
       - .env
@@ -238,7 +240,9 @@ services:
     restart: "no"
 
   proxy:
-    build: .
+    build:
+      context: .
+      target: proxy
     ports:
       - "${PROXY_PORT:-8100}:8100"
     env_file:
