@@ -40,6 +40,7 @@ from app.multi_provider import (
     ProviderRegistry,
     RouteTarget,
     describe_model_capabilities,
+    estimate_embedding_tokens,
     estimate_requested_tokens,
     make_adapter,
     provider_from_legacy,
@@ -268,11 +269,12 @@ PUBLIC_AUTH_PATHS = {"/api/auth/login", "/api/auth/refresh"}
 
 
 def is_machine_api_path(path: str) -> bool:
-    if path in {"/v1/chat/completions", "/v1/models"}:
+    if path in {"/v1/chat/completions", "/v1/models", "/v1/embeddings"}:
         return True
     parts = [part for part in path.split("/") if part]
     return (
         len(parts) == 3 and parts[1:] == ["v1", "models"]
+        or len(parts) == 3 and parts[1:] == ["v1", "embeddings"]
         or len(parts) == 4 and parts[1:] == ["v1", "chat", "completions"]
     )
 
@@ -637,6 +639,113 @@ async def forward_chat_request(app: FastAPI, payload: dict | None, body: bytes, 
     return {"status_code": 502, "logged_status_code": None, "wait_ms": total_wait_ms, "error": last_error, "raw_content": None, "response_payload": {"error": last_error}, "usage": None, "model": selector, "upstream_model": final.get("upstream_model", ""), "provider_id": final.get("provider_id"), "attempts": attempts}
 
 
+async def forward_embeddings_request(app: FastAPI, payload: dict | None) -> dict:
+    if not isinstance(payload, dict):
+        return {"status_code": 400, "error": "Request body must be valid JSON", "response_payload": {"error": "Request body must be valid JSON"}, "attempts": []}
+    try:
+        selector, route_targets = app.state.registry.resolve(payload.get("model"))
+    except ValueError as exc:
+        return {"status_code": 422, "error": str(exc), "response_payload": {"error": str(exc)}, "attempts": []}
+    targets = app.state.registry.enabled_targets(route_targets)
+    if not targets:
+        return {"status_code": 503, "error": "No enabled provider is available for this model route", "response_payload": {"error": "No enabled provider is available for this model route"}, "attempts": []}
+
+    request_payload_json = json.dumps(sanitize(payload))
+    attempts: list[dict] = []
+    last_error = "All provider targets failed"
+    total_wait_ms = 0
+    reservation = estimate_embedding_tokens(payload)
+
+    for index, (provider, upstream_model) in enumerate(targets, start=1):
+        try:
+            url, outgoing = provider.adapter.prepare_embeddings_request(payload, upstream_model)
+        except AdapterError as exc:
+            return {"status_code": 422, "error": str(exc), "response_payload": {"error": str(exc)}, "attempts": attempts}
+        await queue_state.inc(selector)
+        try:
+            wait_ms, reserved = await provider.capacity.acquire(reservation)
+        finally:
+            await queue_state.dec(selector)
+        total_wait_ms += wait_ms
+        started = time.monotonic()
+        timeout = httpx.Timeout(provider.config.timeout_seconds, connect=min(10, provider.config.timeout_seconds))
+        try:
+            response = await app.state.client.post(url, json=outgoing, headers=provider.adapter.headers(), timeout=timeout)
+        except OutboundPolicyError as exc:
+            response_ms = round((time.monotonic() - started) * 1000)
+            await provider.capacity.release(reserved, None)
+            last_error = "Provider destination was blocked by outbound policy"
+            provider.mark_health("offline", last_error)
+            attempts.append({"attempt_number": index, "provider_id": provider.config.id, "upstream_model": upstream_model, "wait_ms": wait_ms, "response_ms": response_ms, "status_code": None, "error_type": "blocked_destination", "fallback_reason": str(exc) if index < len(targets) else None})
+            if index < len(targets):
+                continue
+            break
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            response_ms = round((time.monotonic() - started) * 1000)
+            await provider.capacity.release(reserved, None)
+            last_error = "Provider connection failed"
+            provider.mark_health("offline", type(exc).__name__)
+            attempts.append({"attempt_number": index, "provider_id": provider.config.id, "upstream_model": upstream_model, "wait_ms": wait_ms, "response_ms": response_ms, "status_code": None, "error_type": "connection", "fallback_reason": str(type(exc).__name__) if index < len(targets) else None})
+            if index < len(targets):
+                continue
+            break
+        except httpx.TimeoutException:
+            response_ms = round((time.monotonic() - started) * 1000)
+            await provider.capacity.release(reserved, None)
+            last_error = f"Provider did not respond within the configured {provider.config.timeout_seconds:g}s timeout"
+            provider.mark_health("degraded", last_error)
+            attempts.append({"attempt_number": index, "provider_id": provider.config.id, "upstream_model": upstream_model, "wait_ms": wait_ms, "response_ms": response_ms, "status_code": None, "error_type": "timeout", "fallback_reason": None})
+            break
+        except httpx.RequestError as exc:
+            response_ms = round((time.monotonic() - started) * 1000)
+            await provider.capacity.release(reserved, None)
+            last_error = "Provider request failed"
+            provider.mark_health("offline", type(exc).__name__)
+            attempts.append({"attempt_number": index, "provider_id": provider.config.id, "upstream_model": upstream_model, "wait_ms": wait_ms, "response_ms": response_ms, "status_code": None, "error_type": "unknown", "fallback_reason": None})
+            break
+
+        response_ms = round((time.monotonic() - started) * 1000)
+        provider.observe_status(response.status_code)
+        try:
+            response_body: Any = response.json()
+        except ValueError:
+            response_body = response.text
+        if response.status_code in FALLBACK_STATUS_CODES and index < len(targets):
+            await provider.capacity.release(reserved, None)
+            attempts.append({"attempt_number": index, "provider_id": provider.config.id, "upstream_model": upstream_model, "wait_ms": wait_ms, "response_ms": response_ms, "status_code": response.status_code, "error_type": db.classify_error_type(response.status_code), "fallback_reason": f"HTTP {response.status_code}"})
+            continue
+
+        response_payload = sanitize(response_body) if isinstance(response_body, dict) else response_body
+        usage = response_payload.get("usage") if isinstance(response_payload, dict) else None
+        prompt_tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None
+        cost = provider_cost_breakdown(app, provider.config.id, upstream_model, prompt_tokens, 0)
+        await provider.capacity.release(reserved, prompt_tokens)
+        attempts.append({"attempt_number": index, "provider_id": provider.config.id, "upstream_model": upstream_model, "wait_ms": wait_ms, "response_ms": response_ms, "status_code": response.status_code, "error_type": db.classify_error_type(response.status_code), "fallback_reason": None})
+        route_alias = selector if selector in app.state.registry.routes else None
+        request_id = await db.insert_request(
+            app.state.db, model=selector, wait_ms=total_wait_ms, status_code=response.status_code,
+            request_payload=request_payload_json, response_payload=json.dumps(response_payload),
+            prompt_tokens=prompt_tokens, completion_tokens=0, model_response_ms=response_ms,
+            input_cost=cost["input"], output_cost=cost["output"],
+            estimated_cost=cost["total"],
+            error_type=db.classify_error_type(response.status_code), provider_id=provider.config.id,
+            upstream_model=upstream_model, route_alias=route_alias, attempt_count=len(attempts),
+        )
+        await save_attempts(app.state.db, request_id, attempts)
+        return {"status_code": response.status_code, "error": None, "raw_content": json.dumps(response_payload).encode() if isinstance(response_payload, dict) else response.content, "response_payload": response_payload, "attempts": attempts}
+
+    final = attempts[-1] if attempts else {"provider_id": None, "upstream_model": "", "response_ms": 0}
+    request_id = await db.insert_request(
+        app.state.db, model=selector, wait_ms=total_wait_ms, status_code=None,
+        request_payload=request_payload_json, response_payload=json.dumps({"error": last_error}),
+        prompt_tokens=None, completion_tokens=None, model_response_ms=final.get("response_ms"), error_type=final.get("error_type", "unknown"),
+        provider_id=final.get("provider_id"), upstream_model=final.get("upstream_model"),
+        route_alias=selector if selector in app.state.registry.routes else None, attempt_count=len(attempts),
+    )
+    await save_attempts(app.state.db, request_id, attempts)
+    return {"status_code": 502, "error": last_error, "raw_content": None, "response_payload": {"error": last_error}, "attempts": attempts}
+
+
 class StreamAccumulator:
     def __init__(self) -> None:
         self.response_id = ""
@@ -974,6 +1083,36 @@ async def provider_proxy(request: Request, provider_id: str):
     if scoped_payload.get("stream") is True:
         return await streaming_proxy_response(request.app, scoped_payload)
     result = await forward_chat_request(request.app, scoped_payload, json.dumps(scoped_payload).encode())
+    if result["error"] is not None:
+        return JSONResponse({"error": result["error"], "attempts": result.get("attempts", [])}, status_code=result.get("status_code") or 502)
+    return Response(content=result["raw_content"], status_code=result["status_code"], media_type="application/json")
+
+
+@app.post("/v1/embeddings")
+async def proxy_embeddings(request: Request):
+    body = await request.body()
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        payload = None
+    result = await forward_embeddings_request(request.app, payload)
+    if result["error"] is not None:
+        return JSONResponse({"error": result["error"], "attempts": result.get("attempts", [])}, status_code=result.get("status_code") or 502)
+    return Response(content=result["raw_content"], status_code=result["status_code"], media_type="application/json")
+
+
+@app.post("/{provider_id}/v1/embeddings")
+async def provider_proxy_embeddings(request: Request, provider_id: str):
+    body = await request.body()
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        payload = None
+    scoped_payload, error = provider_scoped_payload(request.app, provider_id, payload)
+    if error is not None:
+        return error
+    assert scoped_payload is not None
+    result = await forward_embeddings_request(request.app, scoped_payload)
     if result["error"] is not None:
         return JSONResponse({"error": result["error"], "attempts": result.get("attempts", [])}, status_code=result.get("status_code") or 502)
     return Response(content=result["raw_content"], status_code=result["status_code"], media_type="application/json")

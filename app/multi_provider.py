@@ -187,6 +187,17 @@ def estimate_requested_tokens(payload: dict[str, Any]) -> int:
     return max(1, (text_size + 3) // 4 + int(requested or 0))
 
 
+def estimate_embedding_tokens(payload: dict[str, Any]) -> int:
+    text_input = payload.get("input", "")
+    if isinstance(text_input, str):
+        text_size = len(text_input)
+    elif isinstance(text_input, list):
+        text_size = sum(len(item) for item in text_input if isinstance(item, str))
+    else:
+        text_size = 0
+    return max(1, (text_size + 3) // 4)
+
+
 def describe_model_capabilities(config: ProviderConfig, model: str) -> dict[str, Any]:
     """Describe only reasoning controls that are known to be safe for a model family."""
     normalized = model.strip().lower()
@@ -263,6 +274,9 @@ class ProviderAdapter:
     def prepare_request(self, payload: dict[str, Any], model: str) -> tuple[str, dict[str, Any]]:
         raise NotImplementedError
 
+    def prepare_embeddings_request(self, payload: dict[str, Any], model: str) -> tuple[str, dict[str, Any]]:
+        raise AdapterError(f"Provider adapter '{self.config.adapter}' does not support embeddings")
+
     async def discover_models(self, client: httpx.AsyncClient) -> list[str]:
         url = resolve_models_url(self.config.base_url, self.config.models_url)
         response = await client.get(url, headers=self.headers(), timeout=min(self.config.timeout_seconds, 30))
@@ -301,6 +315,13 @@ class OpenAICompatibleAdapter(ProviderAdapter):
             outgoing["stream_options"] = stream_options
         outgoing["model"] = model
         return f"{self.config.base_url}/chat/completions", outgoing
+
+    def prepare_embeddings_request(self, payload: dict[str, Any], model: str) -> tuple[str, dict[str, Any]]:
+        if "input" not in payload:
+            raise AdapterError("Embeddings requests require an 'input' field")
+        outgoing = dict(payload)
+        outgoing["model"] = model
+        return f"{self.config.base_url}/embeddings", outgoing
 
 
 def _anthropic_content(content: Any) -> list[dict[str, Any]]:
