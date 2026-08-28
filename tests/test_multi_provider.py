@@ -3,12 +3,14 @@ import unittest
 
 from app.main import StreamAccumulator, TestRequest as DashboardTestRequest, build_test_payload, extract_test_response_content, is_machine_api_path, provider_scoped_payload
 from app.multi_provider import (
+    AdapterError,
     AnthropicAdapter,
     OpenAICompatibleAdapter,
     ProviderConfig,
     ProviderRegistry,
     RouteTarget,
     describe_model_capabilities,
+    estimate_embedding_tokens,
 )
 
 
@@ -46,9 +48,36 @@ class RegistryTests(unittest.TestCase):
     def test_provider_scoped_client_paths_are_machine_authenticated(self):
         self.assertTrue(is_machine_api_path("/v1/chat/completions"))
         self.assertTrue(is_machine_api_path("/v1/models"))
+        self.assertTrue(is_machine_api_path("/v1/embeddings"))
         self.assertTrue(is_machine_api_path("/nvidia/v1/chat/completions"))
         self.assertTrue(is_machine_api_path("/nvidia/v1/models"))
+        self.assertTrue(is_machine_api_path("/nvidia/v1/embeddings"))
         self.assertFalse(is_machine_api_path("/settings/providers"))
+
+    def test_openai_adapter_prepares_embeddings_request(self):
+        config = ProviderConfig.model_validate(provider_payload("first", "https://first.test/v1", default=True))
+        adapter = OpenAICompatibleAdapter(config, "secret")
+        url, outgoing = adapter.prepare_embeddings_request({"input": "hello world"}, "text-embedding-3-small")
+        self.assertEqual(url, "https://first.test/v1/embeddings")
+        self.assertEqual(outgoing["model"], "text-embedding-3-small")
+        self.assertEqual(outgoing["input"], "hello world")
+
+    def test_openai_adapter_rejects_embeddings_without_input(self):
+        config = ProviderConfig.model_validate(provider_payload("first", "https://first.test/v1", default=True))
+        adapter = OpenAICompatibleAdapter(config, "secret")
+        with self.assertRaises(AdapterError):
+            adapter.prepare_embeddings_request({}, "text-embedding-3-small")
+
+    def test_anthropic_adapter_does_not_support_embeddings(self):
+        config = ProviderConfig.model_validate(provider_payload("claude", "https://api.anthropic.com/v1", default=True, adapter="anthropic"))
+        adapter = AnthropicAdapter(config, "secret")
+        with self.assertRaises(AdapterError):
+            adapter.prepare_embeddings_request({"input": "hello"}, "claude-3")
+
+    def test_estimate_embedding_tokens_handles_string_and_list_input(self):
+        self.assertEqual(estimate_embedding_tokens({"input": "abcd"}), 1)
+        self.assertEqual(estimate_embedding_tokens({"input": ["abcd", "efgh"]}), 2)
+        self.assertEqual(estimate_embedding_tokens({}), 1)
 
     def test_provider_scoped_payload_bypasses_default_and_routes(self):
         first = ProviderConfig.model_validate(provider_payload("first", "https://first.test/v1", default=True))
